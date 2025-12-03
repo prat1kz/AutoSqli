@@ -81,6 +81,33 @@ A new tab will appear:
 
 You’re ready to detect SQL injection.
 
+---
+
+# ⚠️ Legal Disclaimer
+
+This tool is intended for **authorized security testing only**.  
+You must have explicit permission to test any target.  
+The developer is not responsible for misuse or illegal activities.
+
+---
+
+# 🤝 Contributing
+
+Contributions, feature requests, and improvements are welcome.  
+Feel free to open issues or submit pull requests.
+
+---
+
+# ❤️ Credits
+
+Developed by **@p2526**  
+
+---
+
+# 📄 License
+
+This project is licensed under the **MIT License**.  
+See the `LICENSE` file for full details.
 
 
 
