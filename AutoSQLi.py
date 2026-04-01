@@ -1,531 +1,349 @@
 # -*- coding: utf-8 -*-
-#
-# AutoSQLi Proxy Scanner - v4 (Responsive UI + Advanced SQLi engine)
-#
-# Features:
-# - Error-based SQLi detection with multi-payload fuzzing
-# - DB-specific signatures: MySQL, PostgreSQL, MSSQL, Oracle
-# - WAF detection (ModSecurity, Cloudflare, etc.)
-# - Skips static files, junk content-types, huge responses
-# - Param / Cookie / Header injection
-# - “Only in scope” scanning mode
-# - Target substring filter
-# - Deduplication for scans + findings
-# - Color-coded results: SQL, 500, WAF
-# - Double click → send injected request to Repeater
-# - Built-in request/response message viewers
-# - Fully responsive UI (auto-resizes like Proxy tab)
-#
+# AutoSQLi - burp proxy sqli scanner
+# scans params, cookies, headers for error-based sqli + waf detection
+# double click any finding -> sends to repeater
 
 from burp import IBurpExtender, IProxyListener, ITab
 from java.lang import Runnable, Thread, Object
-from javax.swing import (
-    JPanel, JTable, JScrollPane, JButton,
-    JCheckBox, JLabel, JTextField, JSplitPane, BoxLayout
-)
+from javax.swing import (JPanel, JTable, JScrollPane, JButton,
+    JCheckBox, JLabel, JTextField, JSplitPane, BoxLayout)
 from javax.swing.table import DefaultTableModel, DefaultTableCellRenderer
 from java.awt import Color, BorderLayout
 from java.awt.event import MouseAdapter
 import re
 
+SQL_ERRORS = [
+    "you have an error in your sql syntax", "mysql server version",
+    "warning: mysql", "warning: mysqli", "unclosed quotation mark",
+    "unterminated quoted string", "syntax error", "ora-", "oracle error",
+    "pg_query", "psql:", "database error", "sqlstate",
+    "odbc sql server driver", "odbc driver"
+]
 
-# ================================================
-# Non-editable table model
-# ================================================
-class NonEditableModel(DefaultTableModel):
-    def isCellEditable(self, row, col):
-        return False
+WAF_SIGNS = [
+    "access denied", "request blocked", "forbidden",
+    "mod_security", "modsecurity", "cloudflare", "incapsula",
+    "blocked by", "web application firewall"
+]
+
+STATIC_RE = re.compile(
+    r".*\.(jpg|jpeg|png|gif|svg|css|js|ico|woff|woff2|ttf|bmp|eot|mp4|mp3|avi|mov|pdf)$",
+    re.IGNORECASE
+)
+
+STR_PAYLOADS  = ["'", '"', "')", '")', "'))", '"))']
+NUM_PAYLOADS  = ["'", ")", "))"]
+MAX_BODY      = 1024 * 1024
+LEN_THRESHOLD = 30
 
 
-# ================================================
-# Main Burp Extension
-# ================================================
+class _Model(DefaultTableModel):
+    def isCellEditable(self, r, c): return False
+
+
 class BurpExtender(IBurpExtender, IProxyListener, ITab):
 
-    SQL_ERRORS = [
-        "you have an error in your sql syntax",
-        "mysql server version",
-        "warning: mysql",
-        "warning: mysqli",
-        "unclosed quotation mark",
-        "unterminated quoted string",
-        "syntax error",
-        "ora-", "oracle error",
-        "pg_query", "psql:",
-        "database error",
-        "sqlstate",
-        "odbc sql server driver",
-        "odbc driver"
-    ]
+    def registerExtenderCallbacks(self, cb):
+        self.cb      = cb
+        self.hlp     = cb.getHelpers()
+        self.out     = cb.getStdout()
+        cb.setExtensionName("AutoSQLi")
+        cb.registerProxyListener(self)
 
-    WAF_PATTERNS = [
-        "access denied", "request blocked", "forbidden",
-        "mod_security", "modsecurity",
-        "cloudflare", "incapsula",
-        "blocked by", "web application firewall"
-    ]
+        self.findings     = []
+        self.shown        = []
+        self.keys         = set()
+        self.seen_urls    = set()
+        self.scan_count   = 0
+        self.hit_count    = 0
+        self.active_filter = "ALL"
 
-    STATIC_EXT = re.compile(
-        r".*\.(jpg|jpeg|png|gif|svg|css|js|ico|woff|woff2|ttf|bmp|eot|mp4|mp3|avi|mov|pdf)$",
-        re.IGNORECASE
-    )
+        self._build_ui()
+        cb.addSuiteTab(self)
+        self.out.write("[+] AutoSQLi loaded\n")
 
-    LENGTH_DIFF_THRESHOLD = 30
-    MAX_BODY_SIZE = 1024 * 1024
-
-    ERROR_PAYLOADS_STRING = ["'", "\"", "')", "\")", "'))", "\"))"]
-    ERROR_PAYLOADS_NUMERIC = ["'", ")", "))"]
-
-    FILTER_ALL = "ALL"
-    FILTER_HTTP = "HTTP"
-    FILTER_SQL = "SQL"
-    FILTER_WAF = "WAF"
-
-    def registerExtenderCallbacks(self, callbacks):
-        self.callbacks = callbacks
-        self.helpers = callbacks.getHelpers()
-        callbacks.setExtensionName("Auto SQLi Proxy Scanner (v4)")
-        callbacks.registerProxyListener(self)
-
-        self.stdout = callbacks.getStdout()
-
-        self.allFindings = []
-        self.filteredFindings = []
-        self.findingKeys = set()
-        self.scannedUrls = set()
-        self.scannedCount = 0
-        self.findingCount = 0
-        self.currentFilter = self.FILTER_ALL
-
-        self.initUI()
-        callbacks.addSuiteTab(self)
-
-        self.stdout.write("[+] AutoSQLi v4 loaded with responsive UI\n")
-
-    # --------------------------------------------
-    # Build GUI (Responsive)
-    # --------------------------------------------
-    def initUI(self):
+    def _build_ui(self):
         self.panel = JPanel(BorderLayout())
 
-        # === Top Controls Row ===
         top = JPanel()
         top.setLayout(BoxLayout(top, BoxLayout.X_AXIS))
 
-        self.chkEnable = JCheckBox("Enable", True)
-        self.chkParams = JCheckBox("Params", True)
-        self.chkCookies = JCheckBox("Cookies", True)
-        self.chkHeaders = JCheckBox("Headers", True)
-        self.chkScope = JCheckBox("Only in-scope", False)
+        self.chk_on      = JCheckBox("Enable",       True)
+        self.chk_params  = JCheckBox("Params",        True)
+        self.chk_cookies = JCheckBox("Cookies",       True)
+        self.chk_headers = JCheckBox("Headers",       True)
+        self.chk_scope   = JCheckBox("In-scope only", False)
 
-        top.add(self.chkEnable)
-        top.add(self.chkParams)
-        top.add(self.chkCookies)
-        top.add(self.chkHeaders)
-        top.add(self.chkScope)
+        for w in [self.chk_on, self.chk_params, self.chk_cookies,
+                  self.chk_headers, self.chk_scope]:
+            top.add(w)
 
-        top.add(JLabel("   Target: "))
-        self.txtTarget = JTextField("", 12)
-        top.add(self.txtTarget)
+        top.add(JLabel("  Target:"))
+        self.txt_target = JTextField("", 12)
+        top.add(self.txt_target)
 
-        self.btnAll = JButton("All", actionPerformed=self.onFilterAll)
-        self.btnHTTP = JButton("HTTP 5xx", actionPerformed=self.onFilterHTTP)
-        self.btnSQL = JButton("SQL errors", actionPerformed=self.onFilterSQL)
-        self.btnWAF = JButton("WAF", actionPerformed=self.onFilterWAF)
-        self.btnClearTable = JButton("Clear Table", actionPerformed=self.onClearTable)
-        self.btnClearAll = JButton("Clear All", actionPerformed=self.onClearAll)
+        for label, fn in [("All",       self._f_all),
+                          ("HTTP 5xx",  self._f_http),
+                          ("SQL",       self._f_sql),
+                          ("WAF",       self._f_waf),
+                          ("Clear View",self._clear_view),
+                          ("Clear All", self._clear_all)]:
+            top.add(JButton(label, actionPerformed=fn))
 
-        top.add(self.btnAll)
-        top.add(self.btnHTTP)
-        top.add(self.btnSQL)
-        top.add(self.btnWAF)
-        top.add(self.btnClearTable)
-        top.add(self.btnClearAll)
-
-        self.lblStats = JLabel("Scanned: 0 | Findings: 0")
-        top.add(self.lblStats)
-
+        self.lbl_stats = JLabel("  scanned:0  hits:0")
+        top.add(self.lbl_stats)
         self.panel.add(top, BorderLayout.NORTH)
 
-        # === Table ===
-        columns = ["URL", "Kind", "Name", "Detail"]
-        self.tableModel = NonEditableModel(columns, 0)
-        self.table = JTable(self.tableModel)
+        self.model = _Model(["URL", "Kind", "Param", "Detail"], 0)
+        self.table = JTable(self.model)
         self.table.setDefaultEditor(Object, None)
-        self.table.setDefaultRenderer(Object, SeverityColorRenderer())
-        self.table.addMouseListener(TableListener(self))
+        self.table.setDefaultRenderer(Object, _ColorRenderer())
+        self.table.addMouseListener(_ClickHandler(self))
 
-        tablePane = JScrollPane(self.table)
+        self.req_view  = self.cb.createMessageEditor(None, False)
+        self.resp_view = self.cb.createMessageEditor(None, False)
 
-        # === Request / Response viewers ===
-        self.reqViewer = self.callbacks.createMessageEditor(None, False)
-        self.respViewer = self.callbacks.createMessageEditor(None, False)
+        bot = JSplitPane(JSplitPane.HORIZONTAL_SPLIT,
+                         self.req_view.getComponent(),
+                         self.resp_view.getComponent())
+        bot.setResizeWeight(0.5)
 
-        reqPane = self.reqViewer.getComponent()
-        respPane = self.respViewer.getComponent()
+        split = JSplitPane(JSplitPane.VERTICAL_SPLIT, JScrollPane(self.table), bot)
+        split.setResizeWeight(0.55)
+        self.panel.add(split, BorderLayout.CENTER)
 
-        # Horizontal split (req | resp)
-        bottomSplit = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, reqPane, respPane)
-        bottomSplit.setResizeWeight(0.5)
+    # tab interface
+    def getTabCaption(self):  return "AutoSQLi"
+    def getUiComponent(self): return self.panel
 
-        # Vertical split (table | responses)
-        mainSplit = JSplitPane(JSplitPane.VERTICAL_SPLIT, tablePane, bottomSplit)
-        mainSplit.setResizeWeight(0.55)
+    # filter buttons
+    def _f_all(self,  e): self.active_filter = "ALL";  self._refresh()
+    def _f_http(self, e): self.active_filter = "HTTP"; self._refresh()
+    def _f_sql(self,  e): self.active_filter = "SQL";  self._refresh()
+    def _f_waf(self,  e): self.active_filter = "WAF";  self._refresh()
 
-        self.panel.add(mainSplit, BorderLayout.CENTER)
+    def _clear_view(self, e):
+        self.model.setRowCount(0)
+        self.shown = []
 
-    # --------------------------------------------
-    # Tab
-    # --------------------------------------------
-    def getTabCaption(self):
-        return "AutoSQLi"
+    def _clear_all(self, e):
+        self.findings   = []
+        self.shown      = []
+        self.keys       = set()
+        self.seen_urls  = set()
+        self.scan_count = 0
+        self.hit_count  = 0
+        self.model.setRowCount(0)
+        self._upd_stats()
 
-    def getUiComponent(self):
-        return self.panel
+    def _refresh(self):
+        self.model.setRowCount(0)
+        self.shown = []
+        for f in self.findings:
+            if not self._matches(f): continue
+            self.model.addRow([f["url"], f["kind"], f["name"], f["detail"]])
+            self.shown.append(f)
 
-    # --------------------------------------------
-    # Filter Handlers
-    # --------------------------------------------
-    def onFilterAll(self, e): self.currentFilter = self.FILTER_ALL; self.refreshTable()
-    def onFilterHTTP(self, e): self.currentFilter = self.FILTER_HTTP; self.refreshTable()
-    def onFilterSQL(self, e): self.currentFilter = self.FILTER_SQL; self.refreshTable()
-    def onFilterWAF(self, e): self.currentFilter = self.FILTER_WAF; self.refreshTable()
-
-    def onClearTable(self, e):
-        self.tableModel.setRowCount(0)
-        self.filteredFindings = []
-
-    def onClearAll(self, e):
-        self.allFindings = []
-        self.filteredFindings = []
-        self.findingKeys = set()
-        self.scannedUrls = set()
-        self.scannedCount = 0
-        self.findingCount = 0
-        self.updateStats()
-        self.tableModel.setRowCount(0)
-
-    def refreshTable(self):
-        self.tableModel.setRowCount(0)
-        self.filteredFindings = []
-
-        for f in self.allFindings:
-            if not self.matchesFilter(f):
-                continue
-            row = [f["url"], f["kind"], f["name"], f["detail"]]
-            self.tableModel.addRow(row)
-            self.filteredFindings.append(f)
-
-    def matchesFilter(self, f):
+    def _matches(self, f):
         d = f["detail"].lower()
-        if self.currentFilter == self.FILTER_ALL:
-            return True
-        if self.currentFilter == self.FILTER_HTTP:
-            return d.startswith("http 5")
-        if self.currentFilter == self.FILTER_SQL:
-            return "sql error" in d
-        if self.currentFilter == self.FILTER_WAF:
-            return d.startswith("waf")
+        if self.active_filter == "ALL":  return True
+        if self.active_filter == "HTTP": return d.startswith("http 5")
+        if self.active_filter == "SQL":  return "sql error" in d
+        if self.active_filter == "WAF":  return d.startswith("waf")
         return True
 
-    def updateStats(self):
-        self.lblStats.setText(
-            "Scanned: %d | Findings: %d" %
-            (self.scannedCount, self.findingCount)
-        )
+    def _upd_stats(self):
+        self.lbl_stats.setText("  scanned:%d  hits:%d" % (self.scan_count, self.hit_count))
 
-    # --------------------------------------------
-    # Add Finding
-    # --------------------------------------------
-    def addFinding(self, url, kind, name, detail, msg):
-        key = url + "|" + kind + "|" + name + "|" + detail
-        if key in self.findingKeys:
-            return
+    def add_finding(self, url, kind, name, detail, msg):
+        k = "%s|%s|%s|%s" % (url, kind, name, detail)
+        if k in self.keys: return
+        self.keys.add(k)
+        self.findings.append({"url": url, "kind": kind, "name": name,
+                               "detail": detail, "message": msg})
+        self.hit_count += 1
+        self._upd_stats()
+        self._refresh()
 
-        self.findingKeys.add(key)
-        self.allFindings.append({
-            "url": url,
-            "kind": kind,
-            "name": name,
-            "detail": detail,
-            "message": msg
-        })
+    def show_row(self, idx):
+        if 0 <= idx < len(self.shown):
+            m = self.shown[idx]["message"]
+            if m:
+                self.req_view.setMessage(m.getRequest(), True)
+                self.resp_view.setMessage(m.getResponse(), False)
 
-        self.findingCount += 1
-        self.updateStats()
-        self.refreshTable()
-
-    # --------------------------------------------
-    # Viewer updates
-    # --------------------------------------------
-    def showFinding(self, index):
-        if index < 0 or index >= len(self.filteredFindings):
-            return
-        msg = self.filteredFindings[index]["message"]
-        if msg:
-            self.reqViewer.setMessage(msg.getRequest(), True)
-            self.respViewer.setMessage(msg.getResponse(), False)
-
-    def sendToRepeater(self, index):
-        if index < 0 or index >= len(self.filteredFindings):
-            return
-
-        f = self.filteredFindings[index]
+    def to_repeater(self, idx):
+        if not (0 <= idx < len(self.shown)): return
+        f   = self.shown[idx]
         msg = f["message"]
-        if msg is None:
-            return
-
-        service = msg.getHttpService()
-        self.callbacks.sendToRepeater(
-            service.getHost(),
-            service.getPort(),
-            service.getProtocol().lower() == "https",
+        if not msg: return
+        svc = msg.getHttpService()
+        self.cb.sendToRepeater(
+            svc.getHost(), svc.getPort(),
+            svc.getProtocol().lower() == "https",
             msg.getRequest(),
             "AutoSQLi: %s %s" % (f["kind"], f["name"])
         )
 
-    # --------------------------------------------
-    # Proxy Intercept Handler
-    # --------------------------------------------
-    def processProxyMessage(self, isReq, message):
-        if not isReq or not self.chkEnable.isSelected():
-            return
+    def processProxyMessage(self, is_req, message):
+        if not is_req or not self.chk_on.isSelected(): return
 
-        base = message.getMessageInfo()
-        analyzed = self.helpers.analyzeRequest(base)
-        urlObj = analyzed.getUrl()
-        url = str(urlObj)
+        base     = message.getMessageInfo()
+        analyzed = self.hlp.analyzeRequest(base)
+        url_obj  = analyzed.getUrl()
+        url      = str(url_obj)
 
-        # Target substring filter
-        target = self.txtTarget.getText().strip().lower()
-        if target and target not in url.lower():
-            return
+        target = self.txt_target.getText().strip().lower()
+        if target and target not in url.lower(): return
+        if self.chk_scope.isSelected() and not self.cb.isInScope(url_obj): return
+        if STATIC_RE.match(url): return
+        if url in self.seen_urls: return
 
-        # Only in-scope?
-        if self.chkScope.isSelected():
-            if not self.callbacks.isInScope(urlObj):
-                return
-
-        if self.STATIC_EXT.match(url):
-            return
-
-        if url in self.scannedUrls:
-            return
-
-        self.scannedUrls.add(url)
-        self.scannedCount += 1
-        self.updateStats()
-
-        Thread(SQLiWorker(self, base)).start()
+        self.seen_urls.add(url)
+        self.scan_count += 1
+        self._upd_stats()
+        Thread(Worker(self, base)).start()
 
 
-# ================================================
-# Table Color Renderer
-# ================================================
-class SeverityColorRenderer(DefaultTableCellRenderer):
-    def getTableCellRendererComponent(self, table, value, sel, focus, row, col):
+class _ColorRenderer(DefaultTableCellRenderer):
+    def getTableCellRendererComponent(self, tbl, val, sel, foc, row, col):
         c = DefaultTableCellRenderer.getTableCellRendererComponent(
-            self, table, value, sel, focus, row, col
-        )
-        detail = str(table.getModel().getValueAt(row, 3)).lower()
-
-        # Colors
-        if detail.startswith("http 5"):
-            c.setBackground(Color(255, 190, 190))  # red
-        elif detail.startswith("waf"):
-            c.setBackground(Color(255, 220, 180))  # orange
-        elif "sql error" in detail:
-            c.setBackground(Color(255, 210, 210))  # pink
-        else:
-            c.setBackground(Color.white)
-
+                self, tbl, val, sel, foc, row, col)
+        d = str(tbl.getModel().getValueAt(row, 3)).lower()
+        if   d.startswith("http 5"):   c.setBackground(Color(255, 190, 190))
+        elif d.startswith("waf"):      c.setBackground(Color(255, 220, 180))
+        elif "sql error" in d:         c.setBackground(Color(255, 210, 210))
+        else:                          c.setBackground(Color.white)
         return c
 
 
-# ================================================
-# Table Mouse Listener
-# ================================================
-class TableListener(MouseAdapter):
-    def __init__(self, ext):
-        self.ext = ext
-
-    def mouseClicked(self, event):
-        table = event.getSource()
-        row = table.getSelectedRow()
-
-        if row >= 0:
-            self.ext.showFinding(row)
-
-        if event.getClickCount() == 2 and row >= 0:
-            self.ext.sendToRepeater(row)
+class _ClickHandler(MouseAdapter):
+    def __init__(self, ext): self.ext = ext
+    def mouseClicked(self, e):
+        row = e.getSource().getSelectedRow()
+        if row < 0: return
+        self.ext.show_row(row)
+        if e.getClickCount() == 2:
+            self.ext.to_repeater(row)
 
 
-# ================================================
-# Worker Thread (SQLi testing logic)
-# ================================================
-class SQLiWorker(Runnable):
-
+class Worker(Runnable):
     def __init__(self, ext, base):
-        self.ext = ext
+        self.ext  = ext
         self.base = base
-        self.helpers = ext.helpers
-        self.callbacks = ext.callbacks
-        self.stdout = ext.stdout
+        self.hlp  = ext.hlp
+        self.cb   = ext.cb
+        self.out  = ext.out
 
     def run(self):
         try:
-            ar = self.helpers.analyzeRequest(self.base)
-
-            if self.ext.chkParams.isSelected():
+            ar = self.hlp.analyzeRequest(self.base)
+            if self.ext.chk_params.isSelected():
                 for p in ar.getParameters():
-                    self.test_param(p)
+                    self._test_param(p)
+            if self.ext.chk_cookies.isSelected():
+                self._test_cookie(ar)
+            if self.ext.chk_headers.isSelected():
+                self._test_headers(ar)
+        except Exception as ex:
+            self.out.write("worker err: %s\n" % ex)
 
-            if self.ext.chkCookies.isSelected():
-                self.test_cookie(ar)
+    def _body_len(self, resp):
+        info = self.hlp.analyzeResponse(resp.getResponse())
+        return len(resp.getResponse()[info.getBodyOffset():])
 
-            if self.ext.chkHeaders.isSelected():
-                self.test_headers(ar)
-
-        except Exception as e:
-            self.stdout.write("ERROR in worker: %s\n" % e)
-
-    # ---- Helpers ----
-    def bodyLen(self, resp):
-        info = self.helpers.analyzeResponse(resp.getResponse())
-        body = resp.getResponse()[info.getBodyOffset():]
-        return len(body)
-
-    def contentType(self, resp):
+    def _ctype(self, resp):
         try:
-            info = self.helpers.analyzeResponse(resp.getResponse())
-            for h in info.getHeaders():
-                h = h.lower()
-                if h.startswith("content-type:"):
-                    return h
-        except:
-            pass
+            for h in self.hlp.analyzeResponse(resp.getResponse()).getHeaders():
+                if h.lower().startswith("content-type:"): return h.lower()
+        except: pass
         return ""
 
-    def useful(self, ct):
-        if not ct:
-            return True
-        if "image/" in ct: return False
-        if "text/css" in ct: return False
-        if "javascript" in ct: return False
-        if "font/" in ct: return False
-        return True
+    def _skip_ctype(self, ct):
+        # skip binary/useless content types, only care about html/json/xml
+        for bad in ["image/", "text/css", "javascript", "font/"]:
+            if bad in ct: return True
+        return False
 
-    # ---- PARAM TEST ----
-    def test_param(self, p):
-        service = self.base.getHttpService()
+    def _base_resp(self, svc, req):
+        resp = self.cb.makeHttpRequest(svc, req)
+        bl   = self._body_len(resp)
+        ct   = self._ctype(resp)
+        if bl > MAX_BODY or self._skip_ctype(ct):
+            return None, None
+        return resp, bl
 
-        baseReq = self.base.getRequest()
-        baseResp = self.callbacks.makeHttpRequest(service, baseReq)
-        baseLen = self.bodyLen(baseResp)
+    def _test_param(self, p):
+        svc  = self.base.getHttpService()
+        req  = self.base.getRequest()
+        _, bl = self._base_resp(svc, req)
+        if bl is None: return
 
-        if baseLen > self.ext.MAX_BODY_SIZE:
-            return
-        if not self.useful(self.contentType(baseResp)):
-            return
-
-        url = str(self.helpers.analyzeRequest(self.base).getUrl())
-
-        val = p.getValue()
-        payloads = self.ext.ERROR_PAYLOADS_NUMERIC if val.isdigit() else self.ext.ERROR_PAYLOADS_STRING
+        url      = str(self.hlp.analyzeRequest(self.base).getUrl())
+        val      = p.getValue()
+        payloads = NUM_PAYLOADS if val.isdigit() else STR_PAYLOADS
 
         for s in payloads:
-            inj = self.helpers.buildParameter(p.getName(), val + s, p.getType())
-            req = self.helpers.updateParameter(baseReq, inj)
-            resp = self.callbacks.makeHttpRequest(service, req)
-            self.check("param", p.getName(), url, baseLen, resp)
+            inj  = self.hlp.buildParameter(p.getName(), val + s, p.getType())
+            resp = self.cb.makeHttpRequest(svc, self.hlp.updateParameter(req, inj))
+            self._check("param", p.getName(), url, bl, resp)
 
-    # ---- COOKIE TEST ----
-    def test_cookie(self, ar):
-        service = self.base.getHttpService()
+    def _test_cookie(self, ar):
+        svc  = self.base.getHttpService()
         body = self.base.getRequest()[ar.getBodyOffset():]
+        req  = self.hlp.buildHttpMessage(ar.getHeaders(), body)
+        _, bl = self._base_resp(svc, req)
+        if bl is None: return
 
-        baseReq = self.helpers.buildHttpMessage(ar.getHeaders(), body)
-        baseResp = self.callbacks.makeHttpRequest(service, baseReq)
-        baseLen = self.bodyLen(baseResp)
-
-        if baseLen > self.ext.MAX_BODY_SIZE:
-            return
-        if not self.useful(self.contentType(baseResp)):
-            return
-
-        url = str(self.helpers.analyzeRequest(self.base).getUrl())
-
-        new_headers = []
-        modified = False
+        url      = str(self.hlp.analyzeRequest(self.base).getUrl())
+        new_hdrs = []
+        hit = False
         for h in ar.getHeaders():
             if h.lower().startswith("cookie:"):
-                new_headers.append(h + "'")
-                modified = True
+                new_hdrs.append(h + "'")
+                hit = True
             else:
-                new_headers.append(h)
+                new_hdrs.append(h)
+        if hit:
+            resp = self.cb.makeHttpRequest(svc, self.hlp.buildHttpMessage(new_hdrs, body))
+            self._check("cookie", "cookie", url, bl, resp)
 
-        if modified:
-            injReq = self.helpers.buildHttpMessage(new_headers, body)
-            resp = self.callbacks.makeHttpRequest(service, injReq)
-            self.check("cookie", "cookie", url, baseLen, resp)
-
-    # ---- HEADER TEST ----
-    def test_headers(self, ar):
-        service = self.base.getHttpService()
+    def _test_headers(self, ar):
+        svc  = self.base.getHttpService()
         body = self.base.getRequest()[ar.getBodyOffset():]
+        req  = self.hlp.buildHttpMessage(ar.getHeaders(), body)
+        _, bl = self._base_resp(svc, req)
+        if bl is None: return
 
-        baseReq = self.helpers.buildHttpMessage(ar.getHeaders(), body)
-        baseResp = self.callbacks.makeHttpRequest(service, baseReq)
-        baseLen = self.bodyLen(baseResp)
-
-        if baseLen > self.ext.MAX_BODY_SIZE:
-            return
-        if not self.useful(self.contentType(baseResp)):
-            return
-
-        url = str(self.helpers.analyzeRequest(self.base).getUrl())
-
+        url = str(self.hlp.analyzeRequest(self.base).getUrl())
         for i, h in enumerate(ar.getHeaders()):
             name = h.split(":", 1)[0].strip().lower()
-            if name in ["host", "content-length"]:
-                continue
+            if name in ["host", "content-length"]: continue  # skip or burp breaks
+            hdrs    = list(ar.getHeaders())
+            hdrs[i] = h + "'"
+            resp    = self.cb.makeHttpRequest(svc, self.hlp.buildHttpMessage(hdrs, body))
+            self._check("header", name, url, bl, resp)
 
-            new_headers = list(ar.getHeaders())
-            new_headers[i] = h + "'"
-
-            injReq = self.helpers.buildHttpMessage(new_headers, body)
-            resp = self.callbacks.makeHttpRequest(service, injReq)
-            self.check("header", name, url, baseLen, resp)
-
-    # ---- CHECK LOGIC ----
-    def check(self, kind, name, url, baseLen, resp):
-        info = self.helpers.analyzeResponse(resp.getResponse())
-        body = resp.getResponse()[info.getBodyOffset():]
-        text = self.helpers.bytesToString(body).lower()
-        newLen = len(body)
-        diff = abs(newLen - baseLen)
-
-        if diff < self.ext.LENGTH_DIFF_THRESHOLD:
-            return
-
+    def _check(self, kind, name, url, base_len, resp):
+        info   = self.hlp.analyzeResponse(resp.getResponse())
+        body   = resp.getResponse()[info.getBodyOffset():]
+        text   = self.hlp.bytesToString(body).lower()
+        diff   = abs(len(body) - base_len)
         status = info.getStatusCode()
 
-        # WAF
-        for w in self.ext.WAF_PATTERNS:
+        if diff < LEN_THRESHOLD: return
+
+        for w in WAF_SIGNS:
             if w in text:
-                self.ext.addFinding(url, kind, name, "WAF / %s (diff=%d)" % (w, diff), resp)
+                self.ext.add_finding(url, kind, name, "WAF/%s (diff=%d)" % (w, diff), resp)
                 return
         if status in (401, 403, 406):
-            self.ext.addFinding(url, kind, name, "WAF / HTTP %d (diff=%d)" % (status, diff), resp)
+            self.ext.add_finding(url, kind, name, "WAF/HTTP%d (diff=%d)" % (status, diff), resp)
             return
-
-        # HTTP 500+
         if status >= 500:
-            self.ext.addFinding(url, kind, name, "HTTP %d (diff=%d)" % (status, diff), resp)
+            self.ext.add_finding(url, kind, name, "HTTP%d (diff=%d)" % (status, diff), resp)
             return
-
-        # SQL errors
-        for e in BurpExtender.SQL_ERRORS:
+        for e in SQL_ERRORS:
             if e in text:
-                self.ext.addFinding(url, kind, name, "SQL error: %s (diff=%d)" % (e, diff), resp)
+                self.ext.add_finding(url, kind, name, "SQL error: %s (diff=%d)" % (e, diff), resp)
                 return
